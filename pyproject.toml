@@ -1,0 +1,23 @@
+[project]
+name = "annas-dl"
+version = "0.1.0"
+description = "Anna's Archive download microservice with parallel CDN failover"
+readme = "README.md"
+requires-python = ">=3.13"  # 3.14t preferred for free-threading
+dependencies = [
+    "boto3>=1.42.40",
+    "fastapi>=0.128.0",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.12.0",
+    "uvicorn>=0.40.0",
+]
+
+[project.scripts]
+annas-dl = "annas_dl.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/annas_dl"]

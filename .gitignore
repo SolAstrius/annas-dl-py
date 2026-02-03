@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Nix
+result
+result-*
+.direnv/
+
+# Environment
+.env
+.env.local
+
+# Keep .python-version tracked (pins 3.14t)

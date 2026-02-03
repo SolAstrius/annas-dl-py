@@ -21,4 +21,7 @@ result-*
 # Kubernetes (contains secrets)
 k8s.yaml
 
+# Claude Code local settings
+.claude/settings.local.json
+
 # Keep .python-version tracked (pins 3.14t)

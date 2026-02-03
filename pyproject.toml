@@ -15,6 +15,11 @@ dependencies = [
 [project.scripts]
 annas-dl = "annas_dl.cli:main"
 
+[dependency-groups]
+dev = [
+    "boto3-stubs[s3]>=1.42.40",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

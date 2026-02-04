@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Public base URL for generating external links (e.g., https://dl.example.com)
+    base_url: str | None = None
+
     # FlareSolverr for DDoS-Guard bypass
     flaresolverr_url: str | None = None
 

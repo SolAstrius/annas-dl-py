@@ -2,9 +2,12 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import httpx
+
+if TYPE_CHECKING:
+    from .search import SearchFilters, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +91,164 @@ class BookMetadata:
     comments_multiple: list[str] = field(default_factory=list)
     classifications_unified: dict = field(default_factory=dict)
     ol_is_primary_linked: bool = False
+
+    def to_jsonld(self, urn: str, base_url: str = "") -> dict:
+        """Convert to JSON-LD format using schema.org + Dublin Core.
+
+        Args:
+            urn: The URN identifier (e.g., "urn:anna:2d4d89...")
+            base_url: Optional base URL for resource links
+
+        Returns:
+            JSON-LD dict compatible with schema.org/Book and Dublin Core
+        """
+        md5_hash = urn.split(":")[-1]
+
+        # Map content_type to schema.org types
+        schema_type = "Book"
+        if self.content_type_best == "magazine":
+            schema_type = "Periodical"
+
+        # Build the JSON-LD document with multiple vocabularies
+        doc: dict = {
+            "@context": {
+                "@vocab": "https://schema.org/",
+                "dc": "http://purl.org/dc/terms/",
+                "dcterms": "http://purl.org/dc/terms/",
+                "bibo": "http://purl.org/ontology/bibo/",
+                "prism": "http://prismstandard.org/namespaces/basic/2.0/",
+            },
+            "@type": schema_type,
+            "@id": urn,
+        }
+
+        # === sameAs: All resolvable URN forms ===
+        same_as = [
+            f"urn:md5:{md5_hash}",  # MD5 URN (equivalent to urn:anna:)
+        ]
+
+        # Add identifier-based URNs and URLs
+        for id_type, values in self.identifiers_unified.items():
+            if not values:
+                continue
+            for v in values:
+                if id_type == "isbn":
+                    same_as.append(f"urn:isbn:{v}")
+                elif id_type == "doi":
+                    same_as.append(f"urn:doi:{v}")
+                    same_as.append(f"https://doi.org/{v}")
+                elif id_type == "oclc":
+                    same_as.append(f"urn:oclc:{v}")
+                    same_as.append(f"https://www.worldcat.org/oclc/{v}")
+                elif id_type == "ol":
+                    same_as.append(f"https://openlibrary.org/works/{v}")
+                elif id_type == "asin":
+                    same_as.append(f"https://www.amazon.com/dp/{v}")
+
+        # Anna's Archive page
+        same_as.append(f"https://annas-archive.li/md5/{md5_hash}")
+
+        if same_as:
+            doc["sameAs"] = same_as
+
+        # === Schema.org fields ===
+        if self.title_best:
+            doc["name"] = self.title_best
+        if self.author_best:
+            doc["author"] = {"@type": "Person", "name": self.author_best}
+        if self.publisher_best:
+            doc["publisher"] = {"@type": "Organization", "name": self.publisher_best}
+        if self.year_best:
+            doc["datePublished"] = self.year_best
+        if self.stripped_description_best:
+            doc["description"] = self.stripped_description_best
+        if self.language_codes:
+            doc["inLanguage"] = self.language_codes[0]
+        if self.extension_best:
+            doc["encodingFormat"] = f"application/{self.extension_best}"
+        if self.filesize_best:
+            doc["contentSize"] = f"{self.filesize_best} bytes"
+        if self.cover_url_best:
+            doc["image"] = self.cover_url_best
+        if self.edition_varia_best:
+            doc["bookEdition"] = self.edition_varia_best
+
+        # ISBN as schema.org property
+        isbns = self.identifiers_unified.get("isbn", [])
+        if isbns:
+            doc["isbn"] = isbns[0] if len(isbns) == 1 else isbns
+
+        # === Dublin Core fields (parallel representation) ===
+        if self.title_best:
+            doc["dc:title"] = self.title_best
+        if self.author_best:
+            doc["dc:creator"] = self.author_best
+        if self.publisher_best:
+            doc["dc:publisher"] = self.publisher_best
+        if self.year_best:
+            doc["dc:date"] = self.year_best
+        if self.language_codes:
+            doc["dc:language"] = self.language_codes[0]
+        if self.stripped_description_best:
+            doc["dc:description"] = self.stripped_description_best
+        if self.extension_best:
+            doc["dc:format"] = f"application/{self.extension_best}"
+
+        # DC identifiers
+        dc_identifiers = [f"urn:md5:{md5_hash}"]
+        for id_type, values in self.identifiers_unified.items():
+            for v in values:
+                if id_type == "isbn":
+                    dc_identifiers.append(f"urn:isbn:{v}")
+                elif id_type == "doi":
+                    dc_identifiers.append(f"doi:{v}")
+                elif id_type == "oclc":
+                    dc_identifiers.append(f"oclc:{v}")
+        doc["dc:identifier"] = dc_identifiers
+
+        # === IPFS content URLs (canonical ipfs:// URIs) ===
+        if self.ipfs_infos:
+            ipfs_urls = list({
+                f"ipfs://{info['ipfs_cid']}"
+                for info in self.ipfs_infos
+                if info.get("ipfs_cid")
+            })
+            if ipfs_urls:
+                doc["contentUrl"] = ipfs_urls
+
+        # === Structured identifiers (schema.org PropertyValue) ===
+        identifiers = [
+            {"@type": "PropertyValue", "propertyID": "md5", "value": md5_hash}
+        ]
+        for id_type, values in self.identifiers_unified.items():
+            if not values:
+                continue
+            for v in values:
+                if id_type in ("isbn", "doi", "oclc", "issn", "lccn"):
+                    identifiers.append(
+                        {"@type": "PropertyValue", "propertyID": id_type, "value": v}
+                    )
+        doc["identifier"] = identifiers
+
+        # Resource URL if base_url provided
+        if base_url:
+            doc["url"] = f"{base_url}/urn/{urn}"
+
+        # Additional authors
+        if self.author_additional:
+            existing_author = doc.get("author")
+            authors = [existing_author] if existing_author else []
+            authors.extend({"@type": "Person", "name": name} for name in self.author_additional)
+            doc["author"] = authors if len(authors) > 1 else authors[0] if authors else None
+            # Also update DC creator
+            all_authors = [self.author_best] + self.author_additional if self.author_best else self.author_additional
+            doc["dc:creator"] = all_authors if len(all_authors) > 1 else all_authors[0] if all_authors else None
+
+        # Content type hint
+        if self.content_type_best:
+            doc["additionalType"] = f"https://annas-archive.li/types/{self.content_type_best}"
+
+        return doc
 
 
 @dataclass
@@ -590,6 +751,59 @@ class AnnasClient:
                 raise LoginError(str(exc)) from exc
 
         raise LoginError(f"All mirrors failed: {last_error}") from last_error
+
+    async def search(self, filters: "SearchFilters") -> list["SearchResult"]:
+        """Search Anna's Archive with automatic failover and DDoS-Guard bypass.
+
+        Uses the table display mode for cleaner HTML parsing.
+
+        Args:
+            filters: Search filters (query, content types, formats, etc.)
+
+        Returns:
+            List of SearchResult objects
+        """
+        from .search import build_search_url, parse_search_results
+
+        last_error: Exception | None = None
+
+        for attempt in range(len(MIRROR_DOMAINS)):
+            domain = self.current_domain
+            url = build_search_url(domain, filters)
+
+            logger.debug("Search attempt %d: %s", attempt + 1, url)
+
+            try:
+                response = await self._request("GET", url, timeout=self._timeout)
+                response.raise_for_status()
+
+                results = parse_search_results(response.text, domain)
+                logger.info(
+                    "Search returned %d results (domain=%s, query=%s)",
+                    len(results),
+                    domain,
+                    filters.query,
+                )
+                return results
+
+            except DDoSGuardError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Search failed (domain=%s, attempt=%d): %s",
+                    domain,
+                    attempt + 1,
+                    exc,
+                )
+
+                if self._is_recoverable_error(exc) and attempt < len(MIRROR_DOMAINS) - 1:
+                    self._rotate_domain()
+                    last_error = exc
+                    continue
+
+                raise AnnasClientError(str(exc)) from exc
+
+        raise AnnasClientError(f"All mirrors failed: {last_error}") from last_error
 
     async def close(self):
         """Close the HTTP client."""

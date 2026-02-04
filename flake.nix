@@ -42,7 +42,7 @@
 
             echo "🐍 $(python --version) | GIL disabled: $(python -c 'import sys; print(not sys._is_gil_enabled())')"
 
-            uv sync --quiet 2>/dev/null || true
+            uv sync 2>/dev/null || true
           '';
 
           # For pydantic-core Rust compilation

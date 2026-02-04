@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .annas_client import (
@@ -28,6 +28,7 @@ from .annas_client import (
 from .config import Settings, get_settings
 from .downloader import DownloadError, download_book
 from .s3 import S3Storage, content_type_for_format
+from .search import ContentType, SearchFilters, SearchResult, SortField
 from .urn import parse_urn, to_urn, WrongResolverError, InvalidUrnError
 
 # Configure logging
@@ -144,6 +145,43 @@ class HealthResponse(BaseModel):
 
     status: str
     version: str
+
+
+# =============================================================================
+# Search Models
+# =============================================================================
+
+
+class SearchResultItem(BaseModel):
+    """A single search result from Anna's Archive.
+
+    Scraped from table view HTML at /search?display=table.
+    """
+
+    id: str  # URN: urn:anna:<hash>
+    hash: str  # Raw MD5 hash
+    title: str
+    author: str | None = None
+    publisher: str | None = None
+    year: str | None = None
+    language: str | None = None
+    content_type: str | None = None  # book_fiction, book_nonfiction, magazine, etc.
+    format: str | None = None  # pdf, epub, mobi, etc.
+    size: str | None = None  # Human-readable: "1.2MB", "500KB"
+    url: str | None = None  # Direct link to Anna's Archive page
+
+
+class SearchResponseModel(BaseModel):
+    """Paginated search results from Anna's Archive.
+
+    Results are scraped from the table view which provides cleaner HTML
+    structure compared to the card view.
+    """
+
+    total_on_page: int  # Number of results on this page
+    page: int
+    items: list[SearchResultItem]
+    query: str
 
 
 # =============================================================================
@@ -278,6 +316,113 @@ async def health_check() -> HealthResponse:
     return HealthResponse(status="ok", version="0.1.0")
 
 
+# =============================================================================
+# Search Endpoint
+# =============================================================================
+
+
+@app.get("/books/search", response_model=SearchResponseModel, tags=["Search"])
+async def search_books(
+    q: str = Query(..., description="Search query"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    sort: str = Query("", description="Sort: '', 'newest', 'oldest', 'largest', 'smallest'"),
+    content: list[str] = Query([], description="Content types: book_fiction, book_nonfiction, magazine, book_comic"),
+    ext: list[str] = Query([], description="File formats: pdf, epub, mobi, djvu, etc."),
+    lang: list[str] = Query([], description="Language codes: en, ru, zh, de, etc."),
+) -> SearchResponseModel:
+    """Search Anna's Archive for books.
+
+    ## Query Examples
+
+    | Query | Finds |
+    |-------|-------|
+    | `Hitchhiker's Guide` | Books with title containing these words |
+    | `Douglas Adams` | Books by Douglas Adams |
+    | `python programming` | Books about Python programming |
+
+    ## Filters
+
+    - **content**: Filter by content type (book_fiction, book_nonfiction, magazine, book_comic)
+    - **ext**: Filter by file format (pdf, epub, mobi, djvu, azw3, fb2)
+    - **lang**: Filter by language code (en, ru, zh, de, fr, es)
+
+    ## Response
+
+    Results are scraped from Anna's Archive table view which provides:
+    - **id**: URN identifier (`urn:anna:<hash>`)
+    - **hash**: Raw MD5 hash for use with download endpoints
+    - **format**: File extension (lowercase)
+    - **size**: Human-readable file size
+
+    ## Notes
+
+    - Uses FlareSolverr for DDoS-Guard bypass when configured
+    - Automatic domain failover across Anna's Archive mirrors
+    - Results limited to what fits on one page (~100 items)
+    """
+    if _annas_client is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    # Map sort string to enum
+    sort_map = {
+        "": SortField.RELEVANCE,
+        "newest": SortField.NEWEST,
+        "oldest": SortField.OLDEST,
+        "largest": SortField.LARGEST,
+        "smallest": SortField.SMALLEST,
+    }
+    sort_field = sort_map.get(sort.lower(), SortField.RELEVANCE)
+
+    # Map content type strings to enums
+    content_type_list = []
+    for ct in content:
+        try:
+            content_type_list.append(ContentType(ct.lower()))
+        except ValueError:
+            pass  # Ignore invalid content types
+
+    filters = SearchFilters(
+        query=q,
+        content_types=content_type_list,
+        formats=[f.lower() for f in ext],
+        languages=[l.lower() for l in lang],
+        page=page,
+        sort=sort_field,
+    )
+
+    try:
+        results = await _annas_client.search(filters)
+    except DDoSGuardError as exc:
+        raise error_response(502, "upstream_error", f"DDoS-Guard bypass failed: {exc}")
+    except AnnasClientError as exc:
+        raise error_response(502, "upstream_error", str(exc))
+
+    # Convert to response model
+    items = [
+        SearchResultItem(
+            id=r.id,
+            hash=r.hash,
+            title=r.title,
+            author=r.author,
+            publisher=r.publisher,
+            year=r.year,
+            language=r.language,
+            content_type=r.content_type.value if r.content_type else None,
+            format=r.format,
+            size=r.size,
+            url=r.url,
+        )
+        for r in results
+    ]
+
+    return SearchResponseModel(
+        total_on_page=len(items),
+        page=page,
+        items=items,
+        query=q,
+    )
+
+
 @app.post("/book/{id:path}/download", response_model=DownloadResponse)
 async def download_book_endpoint(
     id: str,
@@ -376,15 +521,29 @@ async def download_book_endpoint(
     content_type = content_type_for_format(result.format)
     _s3_storage.upload(actual_key, result.content, content_type)
 
-    # Store minimal metadata
+    # Fetch and store full metadata from Anna's Archive
     import json
+    from dataclasses import asdict
 
     metadata = {
         "hash": hash,
-        "title": title,
+        "title": title,  # User-provided title (may differ from AA)
         "format": result.format,
         "size_bytes": result.size_bytes,
     }
+
+    # Try to fetch rich metadata from Anna's Archive
+    try:
+        book_meta = await _annas_client.fetch_metadata(hash)
+        metadata["anna"] = asdict(book_meta)
+        # Include JSON-LD for interoperability
+        settings = get_cached_settings()
+        base_url = settings.base_url or ""
+        metadata["jsonld"] = book_meta.to_jsonld(urn, base_url)
+    except Exception as exc:
+        logger.warning("Failed to fetch metadata for hash=%s: %s", hash, exc)
+        # Continue without rich metadata - download succeeded
+
     meta_key = _s3_storage.meta_key(hash)
     _s3_storage.upload(meta_key, json.dumps(metadata).encode(), "application/json")
 
@@ -456,45 +615,27 @@ async def _ensure_cached(hash: str, urn: str, format_hint: str = "pdf") -> str:
 
     # Cache the result
     import json
+    from dataclasses import asdict
+
     actual_key = _s3_storage.book_key(hash, result.format)
     _s3_storage.upload(actual_key, result.content, content_type_for_format(result.format))
 
     metadata = {"hash": hash, "format": result.format, "size_bytes": result.size_bytes}
+
+    # Try to fetch rich metadata from Anna's Archive
+    try:
+        book_meta = await _annas_client.fetch_metadata(hash)
+        metadata["anna"] = asdict(book_meta)
+        # Include JSON-LD for interoperability
+        settings = get_cached_settings()
+        base_url = settings.base_url or ""
+        metadata["jsonld"] = book_meta.to_jsonld(f"urn:anna:{hash}", base_url)
+    except Exception as exc:
+        logger.warning("Failed to fetch metadata in _ensure_cached for hash=%s: %s", hash, exc)
+
     _s3_storage.upload(_s3_storage.meta_key(hash), json.dumps(metadata).encode(), "application/json")
 
     return result.format
-
-
-@app.get("/urn/{id:path}", response_model=I2LResponse)
-async def resolve_i2l(
-    id: str,
-    redirect: bool = Query(False, description="If true, return 302 redirect instead of JSON"),
-    format: str = Query("pdf", description="Preferred format"),
-) -> I2LResponse | RedirectResponse:
-    """I2L: Resolve URN to a single URL.
-
-    RFC 2483 I2L operation. Returns a URL where the resource can be accessed.
-    If not cached, fetches from Anna's Archive automatically.
-
-    Args:
-        id: URN (urn:anna:<hash>) or raw MD5 hash
-        redirect: If true, returns HTTP 302 redirect to the URL
-        format: Preferred format (pdf, epub, etc.)
-    """
-    if _s3_storage is None:
-        raise error_response(503, "unavailable", "Service not initialized")
-
-    hash, urn = _parse_and_validate_urn(id)
-
-    # Ensure resource is cached (fetches from upstream if needed)
-    actual_format = await _ensure_cached(hash, urn, format)
-
-    key = _s3_storage.book_key(hash, actual_format)
-    url = _s3_storage.get_presigned_url(key, f"{hash}.{actual_format}")
-
-    if redirect:
-        return RedirectResponse(url=url, status_code=302)
-    return I2LResponse(urn=urn, url=url)
 
 
 @app.get("/urn/{id:path}/urls", response_model=I2LsResponse)
@@ -608,17 +749,25 @@ async def resolve_i2n(id: str) -> I2NResponse:
     return I2NResponse(input_urn=id, canonical_urn=canonical)
 
 
-@app.get("/urn/{id:path}/info", response_model=BookInfoResponse)
-async def get_book_info(id: str) -> BookInfoResponse:
+@app.get("/urn/{id:path}/info", response_model=None)
+async def get_book_info(
+    id: str,
+    format: str = Query("json", description="Response format: 'json' or 'jsonld'"),
+) -> BookInfoResponse | JSONResponse:
     """Get book metadata from Anna's Archive without downloading.
 
     Fetches metadata directly from Anna's Archive /db/aarecord_elasticsearch/
     endpoint. Does NOT download the book file - only retrieves metadata.
 
+    Args:
+        id: URN (urn:anna:<hash>) or raw MD5 hash
+        format: Response format - 'json' (default) or 'jsonld' (JSON-LD with schema.org/Dublin Core)
+
     This is useful for:
     - Checking if a book exists before downloading
     - Getting cover URLs, descriptions, identifiers
     - Building search indexes or catalogs
+    - Linked data integration (with format=jsonld)
     """
     if _annas_client is None:
         raise error_response(503, "unavailable", "Service not initialized")
@@ -633,6 +782,16 @@ async def get_book_info(id: str) -> BookInfoResponse:
         raise error_response(404, "not_found", str(exc), urn=urn)
     except AnnasClientError as exc:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+    # Return JSON-LD format if requested
+    if format.lower() == "jsonld":
+        settings = get_cached_settings()
+        base_url = settings.base_url or ""
+        jsonld = meta.to_jsonld(urn, base_url)
+        return JSONResponse(
+            content=jsonld,
+            media_type="application/ld+json",
+        )
 
     return BookInfoResponse(
         urn=urn,
@@ -658,6 +817,38 @@ async def get_book_info(id: str) -> BookInfoResponse:
         has_aa_downloads=meta.has_aa_downloads,
         has_torrent_paths=meta.has_torrent_paths,
     )
+
+
+@app.get("/urn/{id:path}", response_model=I2LResponse)
+async def resolve_i2l(
+    id: str,
+    redirect: bool = Query(False, description="If true, return 302 redirect instead of JSON"),
+    format: str = Query("pdf", description="Preferred format"),
+) -> I2LResponse | RedirectResponse:
+    """I2L: Resolve URN to a single URL.
+
+    RFC 2483 I2L operation. Returns a URL where the resource can be accessed.
+    If not cached, fetches from Anna's Archive automatically.
+
+    Args:
+        id: URN (urn:anna:<hash>) or raw MD5 hash
+        redirect: If true, returns HTTP 302 redirect to the URL
+        format: Preferred format (pdf, epub, etc.)
+    """
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Ensure resource is cached (fetches from upstream if needed)
+    actual_format = await _ensure_cached(hash, urn, format)
+
+    key = _s3_storage.book_key(hash, actual_format)
+    url = _s3_storage.get_presigned_url(key, f"{hash}.{actual_format}")
+
+    if redirect:
+        return RedirectResponse(url=url, status_code=302)
+    return I2LResponse(urn=urn, url=url)
 
 
 @app.post("/books/download", response_model=BatchDownloadResponse)

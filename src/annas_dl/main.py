@@ -321,7 +321,8 @@ async def health_check() -> HealthResponse:
 # =============================================================================
 
 
-@app.get("/books/search", response_model=SearchResponseModel, tags=["Search"])
+@app.get("/search", response_model=SearchResponseModel, tags=["Search"])
+@app.get("/books/search", response_model=SearchResponseModel, tags=["Search"], deprecated=True)
 async def search_books(
     q: str = Query(..., description="Search query"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
@@ -423,7 +424,8 @@ async def search_books(
     )
 
 
-@app.post("/book/{id:path}/download", response_model=DownloadResponse)
+@app.post("/download/{id:path}", response_model=DownloadResponse)
+@app.post("/book/{id:path}/download", response_model=DownloadResponse, deprecated=True)
 async def download_book_endpoint(
     id: str,
     request: DownloadRequest | None = None,
@@ -851,7 +853,8 @@ async def resolve_i2l(
     return I2LResponse(urn=urn, url=url)
 
 
-@app.post("/books/download", response_model=BatchDownloadResponse)
+@app.post("/download", response_model=BatchDownloadResponse)
+@app.post("/books/download", response_model=BatchDownloadResponse, deprecated=True)
 async def download_books_batch(request: BatchDownloadRequest) -> BatchDownloadResponse:
     """Download multiple books in parallel.
 

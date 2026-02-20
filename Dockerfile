@@ -22,9 +22,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.13-slim
 
+# Install libtorrent-rasterbar Python bindings (C++ extension, not pip-installable)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-libtorrent && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
+
+# Symlink system libtorrent into the venv
+RUN VENV_SITE=$(/app/.venv/bin/python -c "import site; print(site.getsitepackages()[0])") && \
+    SYS_SITE=$(find /usr/lib/python3 -name "libtorrent*" -path "*/dist-packages/*" | head -1 | xargs dirname) && \
+    if [ -n "$SYS_SITE" ]; then \
+      ln -sf "$SYS_SITE"/libtorrent* "$VENV_SITE/"; \
+    fi
+
 ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000

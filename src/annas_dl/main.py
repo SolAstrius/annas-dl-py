@@ -26,7 +26,7 @@ from .annas_client import (
     RecordNotFoundError,
 )
 from .config import Settings, get_settings
-from .downloader import DownloadError, download_book
+from .downloader import DownloadError, download_book, set_torrent_session
 from .s3 import S3Storage, content_type_for_format
 from .search import ContentType, SearchFilters, SearchResult, SortField
 from .urn import parse_urn, to_urn, WrongResolverError, InvalidUrnError
@@ -76,9 +76,29 @@ async def lifespan(app: FastAPI):
     _s3_storage = S3Storage.create(settings)
     logger.info("Initialized S3 storage (bucket=%s)", settings.s3_bucket)
 
+    # Initialize torrent session (persistent DHT)
+    if settings.torrent_enabled:
+        try:
+            from .torrent import TorrentSession
+
+            torrent_session = TorrentSession(settings)
+            set_torrent_session(torrent_session)
+            logger.info("Initialized torrent session for BitTorrent fallback")
+        except ImportError:
+            logger.warning("libtorrent not available — torrent fallback disabled")
+        except Exception as exc:
+            logger.warning("Failed to initialize torrent session: %s", exc)
+
     yield
 
     # Cleanup
+    from .downloader import _torrent_session
+
+    if _torrent_session is not None:
+        _torrent_session.shutdown()
+        set_torrent_session(None)
+        logger.info("Shut down torrent session")
+
     if _annas_client:
         await _annas_client.close()
         logger.info("Closed Anna's Archive client")
@@ -538,6 +558,24 @@ async def download_book_endpoint(
     try:
         book_meta = await _annas_client.fetch_metadata(hash)
         metadata["anna"] = asdict(book_meta)
+        # Promote key fields to top level for MCP server compatibility (BookMetadata)
+        if book_meta.title_best:
+            metadata["title"] = book_meta.title_best
+        if book_meta.author_best:
+            metadata["authors"] = book_meta.author_best
+        if book_meta.publisher_best:
+            metadata["publisher"] = book_meta.publisher_best
+        if book_meta.language_codes:
+            metadata["language"] = ", ".join(book_meta.language_codes)
+        if book_meta.filesize_best:
+            b = book_meta.filesize_best
+            metadata["size"] = (
+                f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                else f"{b / 1024:.1f}KB" if b >= 1024
+                else f"{b} bytes"
+            )
+        metadata["url"] = f"https://annas-archive.org/md5/{hash}"
         # Include JSON-LD for interoperability
         settings = get_cached_settings()
         base_url = settings.base_url or ""
@@ -628,6 +666,24 @@ async def _ensure_cached(hash: str, urn: str, format_hint: str = "pdf") -> str:
     try:
         book_meta = await _annas_client.fetch_metadata(hash)
         metadata["anna"] = asdict(book_meta)
+        # Promote key fields to top level for MCP server compatibility (BookMetadata)
+        if book_meta.title_best:
+            metadata["title"] = book_meta.title_best
+        if book_meta.author_best:
+            metadata["authors"] = book_meta.author_best
+        if book_meta.publisher_best:
+            metadata["publisher"] = book_meta.publisher_best
+        if book_meta.language_codes:
+            metadata["language"] = ", ".join(book_meta.language_codes)
+        if book_meta.filesize_best:
+            b = book_meta.filesize_best
+            metadata["size"] = (
+                f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                else f"{b / 1024:.1f}KB" if b >= 1024
+                else f"{b} bytes"
+            )
+        metadata["url"] = f"https://annas-archive.org/md5/{hash}"
         # Include JSON-LD for interoperability
         settings = get_cached_settings()
         base_url = settings.base_url or ""
@@ -784,6 +840,40 @@ async def get_book_info(
         raise error_response(404, "not_found", str(exc), urn=urn)
     except AnnasClientError as exc:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+    # Update S3 metadata if book is already cached (backfill rich metadata)
+    if _s3_storage is not None:
+        import json
+        from dataclasses import asdict
+
+        meta_key = _s3_storage.meta_key(hash)
+        try:
+            existing = json.loads(_s3_storage.download(meta_key))
+        except Exception:
+            existing = None
+
+        if existing is not None:
+            existing["anna"] = asdict(meta)
+            base_url = get_cached_settings().base_url or ""
+            existing["jsonld"] = meta.to_jsonld(urn, base_url)
+            if meta.title_best:
+                existing["title"] = meta.title_best
+            if meta.author_best:
+                existing["authors"] = meta.author_best
+            if meta.publisher_best:
+                existing["publisher"] = meta.publisher_best
+            if meta.language_codes:
+                existing["language"] = ", ".join(meta.language_codes)
+            if meta.filesize_best:
+                b = meta.filesize_best
+                existing["size"] = (
+                    f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                    else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                    else f"{b / 1024:.1f}KB" if b >= 1024
+                    else f"{b} bytes"
+                )
+            existing["url"] = f"https://annas-archive.org/md5/{hash}"
+            _s3_storage.upload(meta_key, json.dumps(existing).encode(), "application/json")
 
     # Return JSON-LD format if requested
     if format.lower() == "jsonld":

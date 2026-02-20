@@ -23,6 +23,18 @@ class Settings(BaseSettings):
     cdn_connect_timeout: float = 5.0
     cdn_download_timeout: float = 45.0
 
+    # IPFS fallback configuration
+    ipfs_gateways: list[str] = [
+        "http://ipfs:8080",
+        "https://ipfs.io",
+    ]
+    ipfs_timeout: float = 60.0  # IPFS can be slower than CDN
+    ipfs_enabled: bool = False  # IPFS content not actively seeded; disabled
+
+    # Torrent fallback configuration
+    torrent_enabled: bool = True  # Set to False to disable torrent fallback
+    torrent_timeout: float = 180.0  # Max seconds per torrent download
+
     # Concurrency settings (free-threaded Python can use real threads)
     max_concurrent_downloads: int = 8
 

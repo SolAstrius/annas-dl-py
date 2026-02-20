@@ -29,6 +29,9 @@
             openssl
             openssl.dev
 
+            # libtorrent C++ library + Python bindings (for torrent fallback)
+            libtorrent-rasterbar
+            python313Packages.libtorrent-rasterbar
           ];
 
           shellHook = ''
@@ -39,6 +42,13 @@
             fi
 
             source .venv/bin/activate
+
+            # Symlink libtorrent into the venv so Python can find it
+            LTSITE=$(python -c "import site; print(site.getsitepackages()[0])")
+            NIXLT="${pkgs.python313Packages.libtorrent-rasterbar}/${pkgs.python313.sitePackages}"
+            if [ -d "$NIXLT" ] && [ ! -e "$LTSITE/libtorrent.so" ]; then
+              ln -sf "$NIXLT"/libtorrent* "$LTSITE/" 2>/dev/null || true
+            fi
 
             echo "🐍 $(python --version) | GIL disabled: $(python -c 'import sys; print(not sys._is_gil_enabled())')"
 

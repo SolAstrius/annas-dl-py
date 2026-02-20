@@ -525,6 +525,19 @@ class AnnasClient:
 
             try:
                 response = await self._request("GET", url, timeout=self._timeout)
+
+                # Check for rate limiting before raise_for_status() so we can
+                # parse the JSON body for the specific error message
+                if response.status_code == 429:
+                    try:
+                        data = response.json()
+                        error = data.get("error", "")
+                    except Exception:
+                        error = ""
+                    if error == AnnasClientError.ERROR_NO_DOWNLOADS or not error:
+                        raise NoDownloadsLeftError(error or "Rate limited (429)")
+                    raise AnnasClientError(f"API error: {error}")
+
                 response.raise_for_status()
                 data = response.json()
 
@@ -554,7 +567,7 @@ class AnnasClient:
                     downloads_done_today=quota.get("downloads_done_today", 0),
                 )
 
-            except DDoSGuardError:
+            except (DDoSGuardError, NoDownloadsLeftError, InvalidKeyError, NotMemberError, RecordNotFoundError):
                 raise
             except Exception as exc:
                 logger.warning(
@@ -664,6 +677,36 @@ class AnnasClient:
         raise AnnasClientError(
             f"All mirrors failed: {last_error}"
         ) from last_error
+
+    async def fetch_torrent_paths(self, hash: str) -> list[dict]:
+        """Fetch torrent path info from metadata's additional field.
+
+        Returns list of dicts with keys: collection, torrent_path, file_level1, file_level2.
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(len(MIRROR_DOMAINS)):
+            domain = self.current_domain
+            url = f"{domain}/db/aarecord_elasticsearch/md5:{hash}.json"
+
+            try:
+                response = await self._request("GET", url, timeout=self._timeout)
+                response.raise_for_status()
+                data = response.json()
+
+                additional = data.get("additional", {})
+                return additional.get("torrent_paths", [])
+
+            except DDoSGuardError:
+                raise
+            except Exception as exc:
+                if self._is_recoverable_error(exc) and attempt < len(MIRROR_DOMAINS) - 1:
+                    self._rotate_domain()
+                    last_error = exc
+                    continue
+                raise AnnasClientError(str(exc)) from exc
+
+        raise AnnasClientError(f"All mirrors failed: {last_error}") from last_error
 
     async def login(self, secret_key: str) -> Session:
         """Log in with secret key and obtain session cookie.

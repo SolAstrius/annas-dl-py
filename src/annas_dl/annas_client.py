@@ -600,6 +600,8 @@ class AnnasClient:
 
             try:
                 response = await self._request("GET", url, timeout=self._timeout)
+                if response.status_code == 404:
+                    raise RecordNotFoundError(f"No record found for md5:{hash}")
                 response.raise_for_status()
                 data = response.json()
 
@@ -657,7 +659,7 @@ class AnnasClient:
                     ol_is_primary_linked=bool(unified.get("ol_is_primary_linked")),
                 )
 
-            except DDoSGuardError:
+            except (DDoSGuardError, RecordNotFoundError):
                 raise
             except Exception as exc:
                 logger.warning(

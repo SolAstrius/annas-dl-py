@@ -18,7 +18,6 @@ from pydantic import BaseModel
 from .annas_client import (
     AnnasClient,
     AnnasClientError,
-    BookMetadata,
     DDoSGuardError,
     InvalidKeyError,
     NoDownloadsLeftError,
@@ -28,7 +27,7 @@ from .annas_client import (
 from .config import Settings, get_settings
 from .downloader import DownloadError, download_book, set_torrent_session
 from .s3 import S3Storage, content_type_for_format
-from .search import ContentType, SearchFilters, SearchResult, SortField
+from .search import ContentType, SearchFilters, SortField
 from .urn import parse_urn, to_urn, WrongResolverError, InvalidUrnError
 
 # Configure logging
@@ -790,7 +789,7 @@ async def resolve_i2c(
         hash=metadata.get("hash", hash),
         title=metadata.get("title"),
         format=metadata.get("format", actual_format),
-        size_bytes=metadata.get("size_bytes"),
+        size_bytes=int(sb) if (sb := metadata.get("size_bytes")) is not None else None,
         content_type=content_type_for_format(metadata.get("format", actual_format)),
         cached=True,
     )
@@ -909,6 +908,105 @@ async def get_book_info(
         has_aa_downloads=meta.has_aa_downloads,
         has_torrent_paths=meta.has_torrent_paths,
     )
+
+
+@app.get("/urn/{id:path}/cover")
+async def resolve_cover(
+    id: str,
+    size: str = Query("L", description="Cover size: S, M, or L (only affects Open Library URLs)"),
+) -> RedirectResponse:
+    """Resolve URN to a book cover image.
+
+    Returns a 302 redirect to the cover image (cached in S3 or fetched from upstream).
+    Tries cover_url_best first, then cover_url_additional in order.
+    """
+    import json
+
+    import httpx
+
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Check S3 cache first
+    for ext in ("jpg", "png", "webp"):
+        cover_key = _s3_storage.cover_key(hash, ext)
+        if _s3_storage.exists(cover_key):
+            logger.info("Cover cache hit for hash=%s", hash)
+            url = _s3_storage.get_presigned_url(cover_key)
+            return RedirectResponse(url=url, status_code=302)
+
+    # Load metadata to find cover URLs
+    meta_key = _s3_storage.meta_key(hash)
+    cover_urls: list[str] = []
+    try:
+        meta_bytes = _s3_storage.download(meta_key)
+        metadata = json.loads(meta_bytes)
+        anna = metadata.get("anna", {})
+        if anna.get("cover_url_best"):
+            cover_urls.append(anna["cover_url_best"])
+        cover_urls.extend(anna.get("cover_url_additional") or [])
+    except Exception:
+        pass
+
+    # If no cached metadata, try fetching from upstream
+    if not cover_urls and _annas_client is not None:
+        try:
+            meta = await _annas_client.fetch_metadata(hash)
+            if meta.cover_url_best:
+                cover_urls.append(meta.cover_url_best)
+            cover_urls.extend(meta.cover_url_additional)
+        except Exception:
+            pass
+
+    if not cover_urls:
+        raise error_response(404, "not_found", "No cover image available", urn=urn)
+
+    # Apply size param to Open Library URLs
+    size = size.upper()
+    if size not in ("S", "M", "L"):
+        size = "L"
+
+    def _apply_ol_size(url: str) -> str:
+        if "covers.openlibrary.org" in url:
+            for s in ("-S.", "-M.", "-L."):
+                if s in url:
+                    return url.replace(s, f"-{size}.")
+        return url
+
+    # Try each URL until one works
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+        for cover_url in cover_urls:
+            cover_url = _apply_ol_size(cover_url)
+            try:
+                response = await http.get(cover_url)
+                if response.status_code != 200:
+                    continue
+                content = response.content
+                if len(content) < 100:  # Skip placeholder/empty images
+                    continue
+
+                # Determine extension from content type
+                ct = response.headers.get("content-type", "")
+                if "png" in ct:
+                    ext = "png"
+                elif "webp" in ct:
+                    ext = "webp"
+                else:
+                    ext = "jpg"
+
+                # Cache to S3
+                cover_key = _s3_storage.cover_key(hash, ext)
+                _s3_storage.upload(cover_key, content, ct or "image/jpeg")
+
+                url = _s3_storage.get_presigned_url(cover_key)
+                return RedirectResponse(url=url, status_code=302)
+            except Exception as exc:
+                logger.warning("Cover fetch failed for %s: %s", cover_url, exc)
+                continue
+
+    raise error_response(404, "not_found", "All cover sources failed", urn=urn)
 
 
 @app.get("/urn/{id:path}", response_model=I2LResponse)

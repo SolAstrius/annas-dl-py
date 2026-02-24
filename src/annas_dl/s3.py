@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Default prefixes (can be overridden via Settings)
 DEFAULT_RAW_PREFIX = "raw/annas"
 DEFAULT_META_PREFIX = "meta/annas"
+DEFAULT_COVERS_PREFIX = "covers/annas"
 
 
 def build_key(hash: str, format: str, prefix: str = DEFAULT_RAW_PREFIX) -> str:
@@ -73,6 +74,10 @@ class S3Storage:
     def meta_key(self, hash: str) -> str:
         """Build S3 key for metadata using configured prefix."""
         return build_meta_key(hash, self._meta_prefix)
+
+    def cover_key(self, hash: str, ext: str = "jpg") -> str:
+        """Build S3 key for a cover image."""
+        return f"{DEFAULT_COVERS_PREFIX}/{hash}.{ext}"
 
     def exists(self, key: str) -> bool:
         """Check if a key exists in S3."""

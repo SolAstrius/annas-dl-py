@@ -20,6 +20,62 @@ from .annas_client import BookMetadata
 
 logger = logging.getLogger(__name__)
 
+# ISO 639-1 (2-letter) → ISO 639-3 (3-letter) mapping.
+# Anna's Archive uses 639-1; we store 639-3 in the database.
+_ISO1_TO_ISO3: dict[str, str] = {
+    "aa": "aar", "ab": "abk", "af": "afr", "ak": "aka", "am": "amh",
+    "an": "arg", "ar": "ara", "as": "asm", "av": "ava", "ay": "aym",
+    "az": "aze", "ba": "bak", "be": "bel", "bg": "bul", "bh": "bih",
+    "bi": "bis", "bm": "bam", "bn": "ben", "bo": "bod", "br": "bre",
+    "bs": "bos", "ca": "cat", "ce": "che", "ch": "cha", "co": "cos",
+    "cr": "cre", "cs": "ces", "cu": "chu", "cv": "chv", "cy": "cym",
+    "da": "dan", "de": "deu", "dv": "div", "dz": "dzo", "ee": "ewe",
+    "el": "ell", "en": "eng", "eo": "epo", "es": "spa", "et": "est",
+    "eu": "eus", "fa": "fas", "ff": "ful", "fi": "fin", "fj": "fij",
+    "fo": "fao", "fr": "fra", "fy": "fry", "ga": "gle", "gd": "gla",
+    "gl": "glg", "gn": "grn", "gu": "guj", "gv": "glv", "ha": "hau",
+    "he": "heb", "hi": "hin", "ho": "hmo", "hr": "hrv", "ht": "hat",
+    "hu": "hun", "hy": "hye", "hz": "her", "ia": "ina", "id": "ind",
+    "ie": "ile", "ig": "ibo", "ii": "iii", "ik": "ipk", "io": "ido",
+    "is": "isl", "it": "ita", "iu": "iku", "ja": "jpn", "jv": "jav",
+    "ka": "kat", "kg": "kon", "ki": "kik", "kj": "kua", "kk": "kaz",
+    "kl": "kal", "km": "khm", "kn": "kan", "ko": "kor", "kr": "kau",
+    "ks": "kas", "ku": "kur", "kv": "kom", "kw": "cor", "ky": "kir",
+    "la": "lat", "lb": "ltz", "lg": "lug", "li": "lim", "ln": "lin",
+    "lo": "lao", "lt": "lit", "lu": "lub", "lv": "lav", "mg": "mlg",
+    "mh": "mah", "mi": "mri", "mk": "mkd", "ml": "mal", "mn": "mon",
+    "mr": "mar", "ms": "msa", "mt": "mlt", "my": "mya", "na": "nau",
+    "nb": "nob", "nd": "nde", "ne": "nep", "ng": "ndo", "nl": "nld",
+    "nn": "nno", "no": "nor", "nr": "nbl", "nv": "nav", "ny": "nya",
+    "oc": "oci", "oj": "oji", "om": "orm", "or": "ori", "os": "oss",
+    "pa": "pan", "pi": "pli", "pl": "pol", "ps": "pus", "pt": "por",
+    "qu": "que", "rm": "roh", "rn": "run", "ro": "ron", "ru": "rus",
+    "rw": "kin", "sa": "san", "sc": "srd", "sd": "snd", "se": "sme",
+    "sg": "sag", "si": "sin", "sk": "slk", "sl": "slv", "sm": "smo",
+    "sn": "sna", "so": "som", "sq": "sqi", "sr": "srp", "ss": "ssw",
+    "st": "sot", "su": "sun", "sv": "swe", "sw": "swa", "ta": "tam",
+    "te": "tel", "tg": "tgk", "th": "tha", "ti": "tir", "tk": "tuk",
+    "tl": "tgl", "tn": "tsn", "to": "ton", "tr": "tur", "ts": "tso",
+    "tt": "tat", "tw": "twi", "ty": "tah", "ug": "uig", "uk": "ukr",
+    "ur": "urd", "uz": "uzb", "ve": "ven", "vi": "vie", "vo": "vol",
+    "wa": "wln", "wo": "wol", "xh": "xho", "yi": "yid", "yo": "yor",
+    "za": "zha", "zh": "zho", "zu": "zul",
+}
+
+
+def _to_iso3(codes: list[str]) -> list[str]:
+    """Convert language codes to ISO 639-3. Passes through 3-letter codes as-is."""
+    result = []
+    for code in codes:
+        code = code.strip().lower()
+        if len(code) == 2:
+            result.append(_ISO1_TO_ISO3.get(code, code))
+        elif len(code) == 3:
+            result.append(code)  # already 639-3
+        elif code:
+            result.append(code)  # unknown format, pass through
+    return result
+
 # Identifier types worth persisting (matches import_anna_bookinfo.py)
 _ID_TYPES = {
     "isbn13", "isbn10", "oclc", "goodreads", "librarything", "ol",
@@ -144,7 +200,7 @@ class Database:
             meta.title_best or hash,                                # $2
             [t for t in meta.title_additional if t] or None,        # $3
             meta.author_best or None,                               # $4
-            meta.language_codes or None,                            # $5
+            _to_iso3(meta.language_codes) or None,                     # $5
             meta.extension_best or None,                            # $6
             _safe_year(meta.year_best),                             # $7
             meta.edition_varia_best or None,                        # $8

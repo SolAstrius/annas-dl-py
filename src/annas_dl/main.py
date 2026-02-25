@@ -6,9 +6,11 @@ caches them in S3, and returns presigned URLs.
 Designed to run with Python 3.13 free-threaded mode for true parallelism.
 """
 
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from functools import lru_cache
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -18,6 +20,7 @@ from pydantic import BaseModel
 from .annas_client import (
     AnnasClient,
     AnnasClientError,
+    BookMetadata,
     DDoSGuardError,
     InvalidKeyError,
     NoDownloadsLeftError,
@@ -25,6 +28,7 @@ from .annas_client import (
     RecordNotFoundError,
 )
 from .config import Settings, get_settings
+from .db import Database
 from .downloader import DownloadError, download_book, set_torrent_session
 from .s3 import S3Storage, content_type_for_format
 from .search import ContentType, SearchFilters, SortField
@@ -41,6 +45,7 @@ logger = logging.getLogger(__name__)
 # Global state (initialized in lifespan)
 _annas_client: AnnasClient | None = None
 _s3_storage: S3Storage | None = None
+_db: Database | None = None
 
 
 @lru_cache
@@ -52,7 +57,7 @@ def get_cached_settings() -> Settings:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup application resources."""
-    global _annas_client, _s3_storage
+    global _annas_client, _s3_storage, _db
 
     settings = get_cached_settings()
 
@@ -74,6 +79,16 @@ async def lifespan(app: FastAPI):
     # Initialize S3 storage
     _s3_storage = S3Storage.create(settings)
     logger.info("Initialized S3 storage (bucket=%s)", settings.s3_bucket)
+
+    # Initialize PostgreSQL (shared annas-mcp database, optional)
+    if settings.database_url:
+        try:
+            _db = Database(settings.database_url)
+            await _db.connect()
+            logger.info("Connected to PostgreSQL")
+        except Exception as exc:
+            logger.warning("Failed to connect to PostgreSQL: %s", exc)
+            _db = None
 
     # Initialize torrent session (persistent DHT)
     if settings.torrent_enabled:
@@ -97,6 +112,9 @@ async def lifespan(app: FastAPI):
         _torrent_session.shutdown()
         set_torrent_session(None)
         logger.info("Shut down torrent session")
+
+    if _db:
+        await _db.close()
 
     if _annas_client:
         await _annas_client.close()
@@ -159,11 +177,18 @@ class BatchDownloadResponse(BaseModel):
     failed: int
 
 
+class ComponentHealth(BaseModel):
+    """Health status of a single component."""
+
+    status: str  # "ok" or "unavailable"
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
-    status: str
+    status: str  # "ok" or "degraded"
     version: str
+    components: dict[str, ComponentHealth] = {}
 
 
 # =============================================================================
@@ -330,9 +355,32 @@ def error_response(status_code: int, error: str, detail: str, urn: str | None = 
 
 
 @app.get("/health", response_model=HealthResponse)
+@app.get("/healthz", response_model=HealthResponse, include_in_schema=False)
 async def health_check() -> HealthResponse:
-    """Health check endpoint."""
-    return HealthResponse(status="ok", version="0.1.0")
+    """Health check endpoint.
+
+    Returns component-level status for S3 and PostgreSQL.
+    Overall status is "ok" if all configured components are healthy,
+    "degraded" if any optional component (db) is down.
+    """
+    components: dict[str, ComponentHealth] = {}
+
+    # S3: required
+    s3_ok = _s3_storage is not None
+    components["s3"] = ComponentHealth(status="ok" if s3_ok else "unavailable")
+
+    # PostgreSQL: optional
+    if _db is not None:
+        db_ok = await _db.ping()
+        components["db"] = ComponentHealth(status="ok" if db_ok else "unavailable")
+
+    degraded = any(c.status != "ok" for c in components.values())
+
+    return HealthResponse(
+        status="degraded" if degraded else "ok",
+        version="0.1.0",
+        components=components,
+    )
 
 
 # =============================================================================
@@ -543,9 +591,6 @@ async def download_book_endpoint(
     _s3_storage.upload(actual_key, result.content, content_type)
 
     # Fetch and store full metadata from Anna's Archive
-    import json
-    from dataclasses import asdict
-
     metadata = {
         "hash": hash,
         "title": title,  # User-provided title (may differ from AA)
@@ -554,6 +599,7 @@ async def download_book_endpoint(
     }
 
     # Try to fetch rich metadata from Anna's Archive
+    book_meta: BookMetadata | None = None
     try:
         book_meta = await _annas_client.fetch_metadata(hash)
         metadata["anna"] = asdict(book_meta)
@@ -585,6 +631,10 @@ async def download_book_endpoint(
 
     meta_key = _s3_storage.meta_key(hash)
     _s3_storage.upload(meta_key, json.dumps(metadata).encode(), "application/json")
+
+    # Persist to PostgreSQL (shared annas-mcp database)
+    if _db and book_meta:
+        await _db.upsert_book(hash, book_meta)
 
     # Generate presigned URL
     filename = f"{title or hash}.{result.format}"
@@ -653,15 +703,13 @@ async def _ensure_cached(hash: str, urn: str, format_hint: str = "pdf") -> str:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
 
     # Cache the result
-    import json
-    from dataclasses import asdict
-
     actual_key = _s3_storage.book_key(hash, result.format)
     _s3_storage.upload(actual_key, result.content, content_type_for_format(result.format))
 
     metadata = {"hash": hash, "format": result.format, "size_bytes": result.size_bytes}
 
     # Try to fetch rich metadata from Anna's Archive
+    book_meta: BookMetadata | None = None
     try:
         book_meta = await _annas_client.fetch_metadata(hash)
         metadata["anna"] = asdict(book_meta)
@@ -691,6 +739,10 @@ async def _ensure_cached(hash: str, urn: str, format_hint: str = "pdf") -> str:
         logger.warning("Failed to fetch metadata in _ensure_cached for hash=%s: %s", hash, exc)
 
     _s3_storage.upload(_s3_storage.meta_key(hash), json.dumps(metadata).encode(), "application/json")
+
+    # Persist to PostgreSQL
+    if _db and book_meta:
+        await _db.upsert_book(hash, book_meta)
 
     return result.format
 
@@ -765,8 +817,6 @@ async def resolve_i2c(
     RFC 2483 I2C operation. Returns metadata about the resource.
     Fetches from upstream if not cached.
     """
-    import json
-
     if _s3_storage is None:
         raise error_response(503, "unavailable", "Service not initialized")
 
@@ -831,27 +881,38 @@ async def get_book_info(
 
     hash, urn = _parse_and_validate_urn(id)
 
-    try:
-        meta = await _annas_client.fetch_metadata(hash)
-    except DDoSGuardError as exc:
-        raise error_response(502, "upstream_error", f"DDoS-Guard bypass failed: {exc}", urn=urn)
-    except RecordNotFoundError as exc:
-        raise error_response(404, "not_found", str(exc), urn=urn)
-    except AnnasClientError as exc:
-        raise error_response(502, "upstream_error", str(exc), urn=urn)
-
-    # Update S3 metadata if book is already cached (backfill rich metadata)
+    # Try serving from S3 cache if rich metadata is present
+    cached_anna: dict | None = None
+    meta_key = _s3_storage.meta_key(hash) if _s3_storage is not None else ""
     if _s3_storage is not None:
-        import json
-        from dataclasses import asdict
-
-        meta_key = _s3_storage.meta_key(hash)
         try:
             existing = json.loads(_s3_storage.download(meta_key))
+            if "anna" in existing:
+                cached_anna = existing["anna"]
         except Exception:
             existing = None
+    else:
+        existing = None
 
-        if existing is not None:
+    if cached_anna is not None:
+        # Serve from cache — reconstruct BookMetadata from the stored dict
+        meta = BookMetadata(**cached_anna)
+        logger.debug("Serving cached metadata for hash=%s", hash)
+    else:
+        # Fetch from upstream
+        try:
+            meta = await _annas_client.fetch_metadata(hash)
+        except DDoSGuardError as exc:
+            raise error_response(502, "upstream_error", f"DDoS-Guard bypass failed: {exc}", urn=urn)
+        except RecordNotFoundError as exc:
+            raise error_response(404, "not_found", str(exc), urn=urn)
+        except AnnasClientError as exc:
+            raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+        # Backfill S3 metadata with rich data
+        if _s3_storage is not None:
+            if existing is None:
+                existing = {"hash": hash}
             existing["anna"] = asdict(meta)
             base_url = get_cached_settings().base_url or ""
             existing["jsonld"] = meta.to_jsonld(urn, base_url)
@@ -873,6 +934,10 @@ async def get_book_info(
                 )
             existing["url"] = f"https://annas-archive.org/md5/{hash}"
             _s3_storage.upload(meta_key, json.dumps(existing).encode(), "application/json")
+
+        # Persist to PostgreSQL
+        if _db:
+            await _db.upsert_book(hash, meta)
 
     # Return JSON-LD format if requested
     if format.lower() == "jsonld":
@@ -920,8 +985,6 @@ async def resolve_cover(
     Returns a 302 redirect to the cover image (cached in S3 or fetched from upstream).
     Tries cover_url_best first, then cover_url_additional in order.
     """
-    import json
-
     import httpx
 
     if _s3_storage is None:
@@ -975,6 +1038,15 @@ async def resolve_cover(
                     return url.replace(s, f"-{size}.")
         return url
 
+    # Known placeholder image hashes (e.g. libgen "BOOK COVER NOT AVAILABLE")
+    _PLACEHOLDER_HASHES = {
+        "6516a47fc69b0f3956f12e7efc984eb1",
+    }
+
+    def _is_placeholder(data: bytes) -> bool:
+        import hashlib
+        return hashlib.md5(data).hexdigest() in _PLACEHOLDER_HASHES
+
     # Try each URL until one works
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
         for cover_url in cover_urls:
@@ -984,7 +1056,7 @@ async def resolve_cover(
                 if response.status_code != 200:
                     continue
                 content = response.content
-                if len(content) < 100:  # Skip placeholder/empty images
+                if len(content) < 100 or _is_placeholder(content):
                     continue
 
                 # Determine extension from content type

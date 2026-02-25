@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # FlareSolverr for DDoS-Guard bypass
     flaresolverr_url: str | None = None
 
+    # PostgreSQL (shared annas-mcp database, optional)
+    database_url: str | None = None
+
     model_config = {"env_prefix": "ANNAS_DL_", "env_file": ".env", "extra": "ignore"}
 
 

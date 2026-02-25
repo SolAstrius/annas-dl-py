@@ -935,10 +935,6 @@ async def get_book_info(
             existing["url"] = f"https://annas-archive.org/md5/{hash}"
             _s3_storage.upload(meta_key, json.dumps(existing).encode(), "application/json")
 
-        # Persist to PostgreSQL
-        if _db:
-            await _db.upsert_book(hash, meta)
-
     # Return JSON-LD format if requested
     if format.lower() == "jsonld":
         settings = get_cached_settings()

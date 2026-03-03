@@ -6,8 +6,10 @@ caches them in S3, and returns presigned URLs.
 Designed to run with Python 3.13 free-threaded mode for true parallelism.
 """
 
+import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -351,6 +353,37 @@ def error_response(status_code: int, error: str, detail: str, urn: str | None = 
     )
 
 
+# Background enrichment
+
+
+async def _enrich_if_needed(hash: str) -> None:
+    """Check if a book's PG metadata needs enrichment and fetch from Anna's Archive API if so.
+
+    Called fire-and-forget on cache hits to backfill missing or bad metadata.
+    """
+    urn = f"urn:anna:{hash}"
+    try:
+        pool = _db._pool  # type: ignore[union-attr]
+        if pool is None:
+            return
+
+        row = await pool.fetchrow("SELECT title FROM books WHERE urn = $1", urn)
+        needs_enrich = row is None or not row["title"] or re.fullmatch(r"[a-f0-9]{32}", row["title"])
+
+        if not needs_enrich:
+            return
+
+        meta = await _annas_client.fetch_metadata(hash)  # type: ignore[union-attr]
+        if not meta.title_best:
+            return
+
+        await _db.upsert_book(hash, meta)  # type: ignore[union-attr]
+        logger.info("Enriched metadata for %s: %s", urn, meta.title_best)
+
+    except Exception:
+        logger.debug("Background enrichment failed for %s", urn, exc_info=True)
+
+
 # Endpoints
 
 
@@ -542,6 +575,10 @@ async def download_book_endpoint(
         logger.info("Cache hit for hash=%s", hash)
         filename = f"{title or hash}.{format_hint}" if title else f"{hash}.{format_hint}"
         url = _s3_storage.get_presigned_url(key, filename)
+
+        # Fire-and-forget: enrich metadata if PG row is missing or has a hash-as-title
+        if _db and _annas_client:
+            asyncio.create_task(_enrich_if_needed(hash))
 
         return DownloadResponse(
             id=urn,

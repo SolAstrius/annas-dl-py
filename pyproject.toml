@@ -12,6 +12,7 @@ dependencies = [
     "selectolax>=0.3.30",
     "asyncpg>=0.30.0",
     "uvicorn>=0.40.0",
+    "textual>=8.0.0",
 ]
 
 [project.scripts]
